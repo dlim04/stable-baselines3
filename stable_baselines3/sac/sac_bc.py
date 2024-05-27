@@ -1,3 +1,5 @@
+import io
+import pathlib
 from typing import Any, Dict, List, Optional, Tuple, Type, TypeVar, Union
 
 import numpy as np
@@ -245,3 +247,27 @@ class SACBC(SAC):
         if len(ent_coef_losses) > 0:
             self.logger.record("train/ent_coef_loss", np.mean(ent_coef_losses))
 
+    @classmethod
+    def load(  # noqa: C901
+        cls: Type[SelfSACBC],
+        path: Union[str, pathlib.Path, io.BufferedIOBase],
+        demo_data: Type[DictReplayBuffer],
+        env: Optional[GymEnv] = None,
+        device: Union[th.device, str] = "auto",
+        custom_objects: Optional[Dict[str, Any]] = None,
+        print_system_info: bool = False,
+        force_reset: bool = True,
+        **kwargs,
+    ) -> SelfSACBC:
+        model = super().load(
+            path,
+            env=env,
+            device=device,
+            custom_objects=custom_objects,
+            print_system_info=print_system_info,
+            force_reset=force_reset,
+            **kwargs,
+            )
+        model.demo_data = demo_data
+
+        return model
