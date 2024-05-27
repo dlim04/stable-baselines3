@@ -11,6 +11,7 @@ from stable_baselines3.common.noise import ActionNoise
 from stable_baselines3.sac.policies import SACPolicy
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
 from stable_baselines3.common.utils import get_parameters_by_name, polyak_update
+from stable_baselines3.common.type_aliases import DictReplayBufferSamples
 
 from stable_baselines3.sac import SAC
 
@@ -141,8 +142,30 @@ class SACBC(SAC):
         )
 
         self.demo_data = demo_data
-        self.demo_data_ratio = 0.5
+        self.demo_data_ratio = 0.3
 
+    def combine_dict_replay_buffers(self, buffer1, buffer2):
+        # Extract data from both buffers
+        obs1, actions1, next_obs1, dones1, rewards1 = buffer1.observations, buffer1.actions, buffer1.next_observations, buffer1.dones, buffer1.rewards
+        obs2, actions2, next_obs2, dones2, rewards2 = buffer2.observations, buffer2.actions, buffer2.next_observations, buffer2.dones, buffer2.rewards
+
+        # Concatenate
+        combined_observations = {key: th.cat((obs1[key], obs2[key]), dim=0) for key in obs1.keys()}
+        combined_actions = th.cat((actions1, actions2), dim=0)
+        combined_next_observations = {key: th.cat((next_obs1[key], next_obs2[key]), dim=0) for key in next_obs1.keys()}
+        combined_dones = th.cat((dones1, dones2), dim=0)
+        combined_rewards = th.cat((rewards1, rewards2), dim=0)
+
+        # Create a new DictReplayBufferSamples instance with the combined data
+        combined_buffer = DictReplayBufferSamples(
+            observations=combined_observations,
+            actions=combined_actions,
+            next_observations=combined_next_observations,
+            dones=combined_dones,
+            rewards=combined_rewards
+        )      
+        return combined_buffer
+     
     def train(self, gradient_steps: int, batch_size: int = 64) -> None:
         # Switch to train mode (this affects batch norm / dropout)
         self.policy.set_training_mode(True)
@@ -155,7 +178,7 @@ class SACBC(SAC):
         self._update_learning_rate(optimizers)
 
         ent_coef_losses, ent_coefs = [], []
-        actor_losses, critic_losses = [], []
+        actor_losses, critic_losses, bc_losses = [], [], []
 
         for gradient_step in range(gradient_steps):
             if self.demo_data is None or not hasattr(self.demo_data, 'sample'):
@@ -165,7 +188,10 @@ class SACBC(SAC):
             demo_data = self.demo_data.sample(batch_size=demo_batch_size)
             prior_data = self.replay_buffer.sample(batch_size - demo_batch_size)
 
-            replay_data = th.cat((demo_data, prior_data), dim=0)
+            # print("type of demo_data:", type(demo_data))
+            # print("type of prior_data:", type(prior_data))
+            replay_data = self.combine_dict_replay_buffers(demo_data, prior_data)
+            # print("type of replay_data:", type(replay_data))
 
             # We need to sample because `log_std` may have changed between two gradient steps
             if self.use_sde:
@@ -219,12 +245,22 @@ class SACBC(SAC):
             critic_loss.backward()
             self.critic.optimizer.step()
 
+            # Calculate behavior cloning loss for demo_data #################################################
+            demo_observations = demo_data.observations
+            demo_actions = demo_data.actions
+            bc_actions = self.actor(demo_observations)
+            behavior_cloning_loss = F.mse_loss(bc_actions, demo_actions)  # For continuous actions
+            bc_losses.append(behavior_cloning_loss.item())
+
             # Compute actor loss #########################################################
             # Alternative: actor_loss = th.mean(log_prob - qf1_pi)
             # Min over all critic networks
             q_values_pi = th.cat(self.critic(replay_data.observations, actions_pi), dim=1)
             min_qf_pi, _ = th.min(q_values_pi, dim=1, keepdim=True)
             actor_loss = (ent_coef * log_prob - min_qf_pi).mean()
+
+            # Add behavior cloning loss to the actor loss
+            actor_loss += behavior_cloning_loss
             actor_losses.append(actor_loss.item())
 
             # Optimize the actor
